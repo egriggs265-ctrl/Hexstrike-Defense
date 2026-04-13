@@ -1,0 +1,172 @@
+mkdir -p ~/hexwatch/{logs,reports,state} && cat > ~/hexwatch/defense_loop.sh <<'EOF'
+#!/usr/bin/env bash
+set -u
+STATE_DIR="$HOME/hexwatch/state"
+LOG_DIR="$HOME/hexwatch/logs"
+REP_DIR="$HOME/hexwatch/reports"
+INTERVAL="${1:-30}"
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:$HOME/go/bin:$HOME/.local/bin:$PATH"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$REP_DIR"
+
+snapshot_listeners() {
+  ss -ltnup 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort
+}
+
+snapshot_processes() {
+  ps -eo pid,ppid,user,%cpu,%mem,etime,comm,args --sort=-%cpu | head -n 40
+}
+
+snapshot_hexstrike() {
+  {
+    echo "==== $(date '+%F %T') HEXSTRIKE HEALTH ===="
+    curl -fsS http://127.0.0.1:8888/health 2>/dev/null || echo "health: unavailable"
+    echo
+    echo "==== VERSION ===="
+    curl -fsS http://127.0.0.1:8888/version 2>/dev/null || echo "version: unavailable"
+    echo
+    echo "==== PORT 8888 ===="
+    ss -ltnp 2>/dev/null | grep ':8888 ' || echo "8888 not listening"
+    echo
+    echo "==== HEXSTRIKE PROCESSES ===="
+    pgrep -af 'hexstrike|theHarvester|amass|paramspider|httpx|python3' || true
+  } > "$REP_DIR/hexstrike_status.txt"
+}
+
+snapshot_system() {
+  {
+    echo "==== $(date '+%F %T') SYSTEM SNAPSHOT ===="
+    echo
+    echo "---- uptime ----"
+    uptime
+    echo
+    echo "---- memory ----"
+    free -h
+    echo
+    echo "---- disk ----"
+    df -h /
+    echo
+    echo "---- top cpu ----"
+    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%cpu | head -n 20
+    echo
+    echo "---- top memory ----"
+    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%mem | head -n 20
+  } > "$REP_DIR/system_status.txt"
+}
+
+snapshot_tools() {
+  {
+    echo "==== $(date '+%F %T') TOOL VISIBILITY ===="
+    for t in hexstrike_server airmon-ng airodump-ng aireplay-ng aircrack-ng amass steghide testdisk shodan checkov uro anew qsreplace theHarvester paramspider curl ss ps tee; do
+      printf '%-15s -> ' "$t"
+      command -v "$t" || echo "missing"
+    done
+  } > "$REP_DIR/tool_status.txt"
+}
+
+snapshot_journal() {
+  {
+    echo "==== $(date '+%F %T') RECENT AUTH FAILURES ===="
+    journalctl -n 200 --no-pager 2>/dev/null | grep -Ei 'failed password|authentication failure|invalid user|sudo:' | tail -n 50 || true
+    echo
+    echo "==== RECENT NETWORK/HTTP 8888 HITS ===="
+    journalctl -n 300 --no-pager 2>/dev/null | grep -E '127\.0\.0\.1|192\.168\.|:8888|GET /health|GET /version' | tail -n 50 || true
+  } > "$REP_DIR/journal_status.txt"
+}
+
+alert_checks() {
+  local alerts=0
+  : > "$REP_DIR/alerts.txt"
+
+  if ss -ltn 2>/dev/null | grep -q '0.0.0.0:8888'; then
+    echo "[ALERT] HexStrike API is exposed on 0.0.0.0:8888" >> "$REP_DIR/alerts.txt"
+    alerts=1
+  fi
+
+  if ! curl -fsS http://127.0.0.1:8888/health >/dev/null 2>&1; then
+    echo "[ALERT] HexStrike health endpoint is not responding on 127.0.0.1:8888" >> "$REP_DIR/alerts.txt"
+    alerts=1
+  fi
+
+  if command -v airmon-ng >/dev/null 2>&1 && ! command -v airodump-ng >/dev/null 2>&1; then
+    echo "[ALERT] Partial wireless toolchain detected" >> "$REP_DIR/alerts.txt"
+    alerts=1
+  fi
+
+  if [ ! -x "$HOME/.local/bin/theHarvester" ] && [ ! -x "$HOME/.local/share/pipx/venvs/theharvester/bin/theHarvester" ]; then
+    echo "[ALERT] theHarvester not executable from expected user paths" >> "$REP_DIR/alerts.txt"
+    alerts=1
+  fi
+
+  return $alerts
+}
+
+diff_listeners() {
+  local curr="$STATE_DIR/listeners.curr"
+  local prev="$STATE_DIR/listeners.prev"
+  snapshot_listeners > "$curr"
+
+  if [ -f "$prev" ]; then
+    {
+      echo "==== $(date '+%F %T') LISTENER DIFF ===="
+      echo
+      echo "---- added listeners ----"
+      comm -13 "$prev" "$curr" || true
+      echo
+      echo "---- removed listeners ----"
+      comm -23 "$prev" "$curr" || true
+    } > "$REP_DIR/listener_diff.txt"
+  else
+    {
+      echo "==== $(date '+%F %T') LISTENER DIFF ===="
+      echo "Baseline created."
+    } > "$REP_DIR/listener_diff.txt"
+  fi
+
+  cp "$curr" "$prev"
+}
+
+render_dashboard() {
+  clear
+  echo "==================== HEXWATCH DEFENSE LOOP ===================="
+  date
+  echo
+  [ -s "$REP_DIR/alerts.txt" ] && cat "$REP_DIR/alerts.txt" || echo "[OK] No active alerts"
+  echo
+  echo "---- HexStrike status ----"
+  sed -n '1,40p' "$REP_DIR/hexstrike_status.txt"
+  echo
+  echo "---- Listener diff ----"
+  sed -n '1,40p' "$REP_DIR/listener_diff.txt"
+  echo
+  echo "---- Tool status ----"
+  sed -n '1,30p' "$REP_DIR/tool_status.txt"
+  echo
+  echo "Reports: $REP_DIR"
+  echo "Logs:    $LOG_DIR"
+  echo "Interval: ${INTERVAL}s"
+}
+
+while true; do
+  snapshot_hexstrike
+  snapshot_system
+  snapshot_tools
+  snapshot_journal
+  diff_listeners
+  alert_checks || true
+
+  {
+    echo "===== $(date '+%F %T') ====="
+    [ -s "$REP_DIR/alerts.txt" ] && cat "$REP_DIR/alerts.txt" || echo "[OK] No active alerts"
+    echo
+    sed -n '1,25p' "$REP_DIR/hexstrike_status.txt"
+    echo
+    sed -n '1,20p' "$REP_DIR/listener_diff.txt"
+    echo
+  } >> "$LOG_DIR/defense_loop.log"
+
+  render_dashboard
+  sleep "$INTERVAL"
+done
+EOF
+chmod +x ~/hexwatch/defense_loop.sh && ~/hexwatch/defense_loop.sh 30
