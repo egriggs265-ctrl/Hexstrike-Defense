@@ -1,0 +1,826 @@
+mkdir -p ~/hexwatch_v3 && cat > ~/hexwatch_v3/hexwatch_monolith_v3.sh <<'EOF'
+#!/usr/bin/env bash
+# HexWatch Monolith v3
+# Defensive orchestration + scoring + fingerprinting + safe containment
+# Single-script architecture, Bash-first.
+
+set -Eeuo pipefail
+
+###############################################################################
+# GLOBALS
+###############################################################################
+
+BASE="${HOME}/hexwatch_v3"
+BIN="${BASE}/bin"
+LOG="${BASE}/logs"
+REP="${BASE}/reports"
+ARC="${BASE}/archive"
+STATE="${BASE}/state"
+AI="${BASE}/ai"
+RUN="${BASE}/run"
+TMP="${BASE}/tmp"
+CFG="${BASE}/config"
+
+INTERVAL_DEFENSE="${INTERVAL_DEFENSE:-20}"
+INTERVAL_AI="${INTERVAL_AI:-45}"
+INTERVAL_MAIN="${INTERVAL_MAIN:-90}"
+INTERVAL_RENDER="${INTERVAL_RENDER:-2}"
+INTERVAL_ARCHIVE="${INTERVAL_ARCHIVE:-300}"
+
+COOLDOWN_FIREWALL_8888="${COOLDOWN_FIREWALL_8888:-300}"
+COOLDOWN_RESTART_HEXSTRIKE="${COOLDOWN_RESTART_HEXSTRIKE:-180}"
+COOLDOWN_RESTART_MCP="${COOLDOWN_RESTART_MCP:-180}"
+COOLDOWN_WRAPPER_REPAIR="${COOLDOWN_WRAPPER_REPAIR:-600}"
+COOLDOWN_FINGERPRINT_PORT="${COOLDOWN_FINGERPRINT_PORT:-300}"
+COOLDOWN_BLOCK_PORT="${COOLDOWN_BLOCK_PORT:-300}"
+
+HEX_PORT="${HEX_PORT:-8888}"
+HEX_HEALTH_URL="http://127.0.0.1:${HEX_PORT}/health"
+HEX_VERSION_URL="http://127.0.0.1:${HEX_PORT}/version"
+HEX_SERVER_CMD="${HEX_SERVER_CMD:-hexstrike_server --port ${HEX_PORT}}"
+HEX_MCP_CMD="${HEX_MCP_CMD:-python3 /usr/share/hexstrike-ai/hexstrike_mcp.py --server http://127.0.0.1:${HEX_PORT}}"
+
+# Space-separated whitelist of ports considered expected/public-safe for this host.
+WHITELIST_PORTS="${WHITELIST_PORTS:-22 631 8888}"
+# Process names treated as noise/expected for listener churn.
+NOISE_PROCESSES_REGEX="${NOISE_PROCESSES_REGEX:-firefox|chrome|mozilla|avahi|mdns}"
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:${HOME}/go/bin:${HOME}/.local/bin:${PATH}"
+
+MAIN_LOG="${LOG}/hexwatch_monolith_v3.log"
+ERR_LOG="${LOG}/hexwatch_monolith_v3.err"
+ACTION_LOG="${LOG}/actions.log"
+EVENT_QUEUE="${STATE}/events.queue"
+EVENT_QUEUE_SEEN="${STATE}/events.queue.seen"
+RUNTIME_JSON="${STATE}/runtime_state.json"
+
+###############################################################################
+# ERROR HANDLING
+###############################################################################
+
+trap 'printf "[%s] ERR line=%s cmd=%q\n" "$(date "+%F %T")" "$LINENO" "$BASH_COMMAND" >> "$ERR_LOG"' ERR
+
+###############################################################################
+# CORE
+###############################################################################
+
+init_dirs() {
+  mkdir -p "$BASE" "$BIN" "$LOG" "$REP" "$ARC" "$STATE" "$AI" "$RUN" "$TMP" "$CFG" "$HOME/.local/bin" "$HOME/.local/src"
+}
+
+ts() { date '+%F %T'; }
+epoch() { date +%s; }
+
+log_msg() {
+  printf '[%s] %s\n' "$(ts)" "$*" | tee -a "$MAIN_LOG" >/dev/null
+}
+
+action_msg() {
+  printf '[%s] %s\n' "$(ts)" "$*" | tee -a "$ACTION_LOG" >/dev/null
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+safe_cat() {
+  local f="$1" lines="${2:-120}"
+  [ -f "$f" ] && sed -n "1,${lines}p" "$f" || echo "missing"
+}
+
+write_atomic() {
+  local target="$1"
+  local tmp_file="${target}.tmp.$$"
+  cat > "$tmp_file"
+  mv -f "$tmp_file" "$target"
+}
+
+file_age() {
+  local f="$1"
+  [ -f "$f" ] || { echo 999999; return 0; }
+  local now mt
+  now="$(epoch)"
+  mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  echo $((now - mt))
+}
+
+emit_event() {
+  printf '%s | %s | %s\n' "$(date -Is)" "$1" "$2" >> "$EVENT_QUEUE"
+}
+
+can_run_action() {
+  local name="$1" cooldown="$2"
+  local stamp_file="${STATE}/action_${name}.stamp"
+  local now last=0
+  now="$(epoch)"
+  [ -f "$stamp_file" ] && last="$(cat "$stamp_file" 2>/dev/null || echo 0)"
+  [ $((now - last)) -ge "$cooldown" ]
+}
+
+mark_action_run() {
+  epoch > "${STATE}/action_${1}.stamp"
+}
+
+is_whitelisted_port() {
+  local port="$1"
+  echo " ${WHITELIST_PORTS} " | grep -q " ${port} "
+}
+
+record_runtime_state() {
+  local health="${1:-unknown}"
+  local risk="${2:-unknown}"
+  local score="${3:-0}"
+  local action="${4:-none}"
+  local fw_count="${5:-0}"
+
+  {
+    printf '{\n'
+    printf '  "updated_at": "%s",\n' "$(date -Is)"
+    printf '  "health": "%s",\n' "$health"
+    printf '  "risk": "%s",\n' "$risk"
+    printf '  "score": %s,\n' "$score"
+    printf '  "last_action": "%s",\n' "$action"
+    printf '  "firewall_rule_count": %s,\n' "$fw_count"
+    printf '  "whitelist_ports": "%s"\n' "$WHITELIST_PORTS"
+    printf '}\n'
+  } | write_atomic "${STATE}/runtime_state.json"
+}
+
+###############################################################################
+# ROOT HELPER
+###############################################################################
+
+write_root_helper() {
+  cat > "${BIN}/hexwatch_rootctl.sh" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PORT="${HEX_PORT:-8888}"
+
+rule_exists() {
+  iptables -S INPUT 2>/dev/null | grep -Fq -- "-A INPUT ! -s 127.0.0.1/32 -p tcp -m tcp --dport ${PORT} -j DROP"
+}
+
+dedupe_rule() {
+  local count
+  count="$(iptables -S INPUT 2>/dev/null | grep -F -- "-A INPUT ! -s 127.0.0.1/32 -p tcp -m tcp --dport ${PORT} -j DROP" | wc -l)"
+  while [ "${count:-0}" -gt 1 ]; do
+    iptables -D INPUT ! -s 127.0.0.1/32 -p tcp --dport "${PORT}" -j DROP >/dev/null 2>&1 || true
+    count="$(iptables -S INPUT 2>/dev/null | grep -F -- "-A INPUT ! -s 127.0.0.1/32 -p tcp -m tcp --dport ${PORT} -j DROP" | wc -l)"
+  done
+  if ! rule_exists; then
+    iptables -I INPUT 1 ! -s 127.0.0.1/32 -p tcp --dport "${PORT}" -j DROP >/dev/null 2>&1 || true
+  fi
+}
+
+count_rule() {
+  iptables -S INPUT 2>/dev/null | grep -F -- "-A INPUT ! -s 127.0.0.1/32 -p tcp -m tcp --dport ${PORT} -j DROP" | wc -l
+}
+
+block_port_nonlocal() {
+  local p="$2"
+  iptables -C INPUT ! -s 127.0.0.1/32 -p tcp --dport "${p}" -j DROP >/dev/null 2>&1 || \
+  iptables -I INPUT 1 ! -s 127.0.0.1/32 -p tcp --dport "${p}" -j DROP >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  ensure_8888_localonly)
+    dedupe_rule
+    ;;
+  count_8888_rule)
+    count_rule
+    ;;
+  clear_8888_rule)
+    while iptables -D INPUT ! -s 127.0.0.1/32 -p tcp --dport "${PORT}" -j DROP >/dev/null 2>&1; do :; done
+    ;;
+  block_port_nonlocal)
+    block_port_nonlocal "$@"
+    ;;
+  *)
+    echo "usage: $0 {ensure_8888_localonly|count_8888_rule|clear_8888_rule|block_port_nonlocal <port>}" >&2
+    exit 1
+    ;;
+esac
+EOS
+  chmod +x "${BIN}/hexwatch_rootctl.sh"
+}
+
+firewall_rule_count() {
+  sudo "${BIN}/hexwatch_rootctl.sh" count_8888_rule 2>/dev/null || echo 0
+}
+
+rule_present() {
+  [ "$(firewall_rule_count)" -ge 1 ]
+}
+
+ensure_firewall_rule() {
+  if can_run_action firewall_8888 "$COOLDOWN_FIREWALL_8888"; then
+    sudo "${BIN}/hexwatch_rootctl.sh" ensure_8888_localonly >/dev/null 2>&1 || true
+    mark_action_run firewall_8888
+    action_msg "Ensured localhost-only defensive rule for tcp/${HEX_PORT}"
+  fi
+}
+
+block_port_nonlocal() {
+  local port="$1"
+  if is_whitelisted_port "$port"; then
+    return 0
+  fi
+  if can_run_action "block_port_${port}" "$COOLDOWN_BLOCK_PORT"; then
+    sudo "${BIN}/hexwatch_rootctl.sh" block_port_nonlocal "$port" >/dev/null 2>&1 || true
+    mark_action_run "block_port_${port}"
+    action_msg "Blocked non-local TCP access to port ${port}"
+    emit_event "port.blocked" "port=${port}"
+  fi
+}
+
+###############################################################################
+# TOOL HEALING
+###############################################################################
+
+create_tool_wrappers() {
+  local changed=0
+
+  if have_cmd theHarvester && [ ! -x "${HOME}/.local/bin/theharvester" ]; then
+    ln -sf "$(command -v theHarvester)" "${HOME}/.local/bin/theharvester" || true
+    changed=1
+  fi
+
+  if have_cmd shodan && [ ! -x "${HOME}/.local/bin/shodan-cli" ]; then
+    ln -sf "$(command -v shodan)" "${HOME}/.local/bin/shodan-cli" || true
+    changed=1
+  fi
+
+  if have_cmd censys && [ ! -x "${HOME}/.local/bin/censys-cli" ]; then
+    ln -sf "$(command -v censys)" "${HOME}/.local/bin/censys-cli" || true
+    changed=1
+  fi
+
+  if [ "$changed" -eq 1 ]; then
+    action_msg "Created or repaired one or more tool wrappers"
+    emit_event "tool.wrapper.repaired" "wrapper repair"
+  fi
+}
+
+###############################################################################
+# SERVICE HEALTH / CONTROL
+###############################################################################
+
+hex_health_up() {
+  curl -fsS "$HEX_HEALTH_URL" >/dev/null 2>&1
+}
+
+hex_mcp_running() {
+  pgrep -af 'hexstrike_mcp.py|/usr/bin/hexstrike_mcp' >/dev/null 2>&1
+}
+
+hex_server_running() {
+  pgrep -af 'hexstrike_server.py|hexstrike_server --port '"${HEX_PORT}" >/dev/null 2>&1
+}
+
+hex_listener_up() {
+  ss -ltn 2>/dev/null | grep -q ":${HEX_PORT} "
+}
+
+start_hexstrike_server() {
+  if can_run_action restart_hexstrike "$COOLDOWN_RESTART_HEXSTRIKE"; then
+    pkill -f 'hexstrike_server --port '"${HEX_PORT}" >/dev/null 2>&1 || true
+    pkill -f 'hexstrike_server.py --port '"${HEX_PORT}" >/dev/null 2>&1 || true
+    nohup bash -lc "export PATH=\"$PATH\"; ${HEX_SERVER_CMD}" > "${LOG}/hexstrike_server.out" 2>&1 &
+    sleep 4
+    mark_action_run restart_hexstrike
+    action_msg "Started HexStrike server"
+    emit_event "service.restart" "hexstrike_server"
+  fi
+}
+
+start_hexstrike_mcp() {
+  if can_run_action restart_mcp "$COOLDOWN_RESTART_MCP"; then
+    pkill -f 'hexstrike_mcp.py|/usr/bin/hexstrike_mcp' >/dev/null 2>&1 || true
+    nohup bash -lc "export PATH=\"$PATH\"; ${HEX_MCP_CMD}" > "${LOG}/hexstrike_mcp.out" 2>&1 &
+    sleep 3
+    mark_action_run restart_mcp
+    action_msg "Started HexStrike MCP"
+    emit_event "service.restart" "hexstrike_mcp"
+  fi
+}
+
+ensure_hexstrike_running() {
+  hex_health_up || start_hexstrike_server
+  hex_mcp_running || start_hexstrike_mcp
+}
+
+###############################################################################
+# NETWORK SNAPSHOTS
+###############################################################################
+
+snapshot_listeners() {
+  ss -ltnup 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort
+}
+
+snapshot_connections() {
+  ss -tnp 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort
+}
+
+diff_listeners() {
+  local curr="${STATE}/listeners.curr"
+  local prev="${STATE}/listeners.prev"
+
+  snapshot_listeners > "$curr"
+
+  if [ -f "$prev" ]; then
+    {
+      echo "==== $(ts) LISTENER DIFF ===="
+      echo
+      echo "---- added listeners ----"
+      comm -13 "$prev" "$curr" || true
+      echo
+      echo "---- removed listeners ----"
+      comm -23 "$prev" "$curr" || true
+    } | write_atomic "${REP}/listener_diff.txt"
+  else
+    {
+      echo "==== $(ts) LISTENER DIFF ===="
+      echo "Baseline created."
+    } | write_atomic "${REP}/listener_diff.txt"
+  fi
+
+  cp -f "$curr" "$prev"
+}
+
+diff_connections() {
+  local curr="${STATE}/connections.curr"
+  local prev="${STATE}/connections.prev"
+
+  snapshot_connections > "$curr"
+
+  if [ -f "$prev" ]; then
+    {
+      echo "==== $(ts) CONNECTION DIFF ===="
+      echo
+      echo "---- new outbound/established ----"
+      comm -13 "$prev" "$curr" || true
+      echo
+      echo "---- removed outbound/established ----"
+      comm -23 "$prev" "$curr" || true
+    } | write_atomic "${REP}/connection_diff.txt"
+  else
+    {
+      echo "==== $(ts) CONNECTION DIFF ===="
+      echo "Baseline created."
+    } | write_atomic "${REP}/connection_diff.txt"
+  fi
+
+  cp -f "$curr" "$prev"
+}
+
+build_classified_listener_report() {
+  local src="${REP}/listener_diff.txt"
+  {
+    echo "==== $(ts) LISTENER DIFF CLASSIFIED ===="
+    echo
+    echo "---- browser_noise ----"
+    grep -iE "${NOISE_PROCESSES_REGEX}" "$src" 2>/dev/null || true
+    echo
+    echo "---- public ----"
+    grep -E '0\.0\.0\.0:' "$src" 2>/dev/null | grep -viE "${NOISE_PROCESSES_REGEX}" || true
+    echo
+    echo "---- loopback ----"
+    grep -E '127\.0\.0\.1:' "$src" 2>/dev/null | grep -viE "${NOISE_PROCESSES_REGEX}" || true
+    echo
+    echo "---- other ----"
+    grep -vE "${NOISE_PROCESSES_REGEX}|0\.0\.0\.0:|127\.0\.0\.1:" "$src" 2>/dev/null || true
+  } | write_atomic "${REP}/listener_diff.classified.txt"
+}
+
+###############################################################################
+# FINGERPRINTING
+###############################################################################
+
+fingerprint_port() {
+  local port="$1"
+  {
+    echo "=== fingerprint $(date -Is) port ${port} ==="
+    echo
+    echo "--- ss ---"
+    ss -ltnup 2>/dev/null | grep ":${port} " || true
+    echo
+    echo "--- lsof ---"
+    lsof -i :"${port}" 2>/dev/null || true
+    echo
+    echo "--- ps ---"
+    ps -ef | grep -v grep | grep -E "${port}|hexstrike|firefox|python3" || true
+  } | write_atomic "${REP}/fingerprint_port_${port}.txt"
+}
+
+fingerprint_new_public_ports() {
+  local src="${REP}/listener_diff.classified.txt"
+  [ -f "$src" ] || return 0
+
+  grep -A50 '^---- public ----' "$src" 2>/dev/null | grep -Eo ':[0-9]{2,5}\b' | tr -d ':' | sort -u | while read -r port; do
+    [ -n "$port" ] || continue
+    if is_whitelisted_port "$port"; then
+      continue
+    fi
+    if can_run_action "fingerprint_port_${port}" "$COOLDOWN_FINGERPRINT_PORT"; then
+      fingerprint_port "$port"
+      mark_action_run "fingerprint_port_${port}"
+      emit_event "listener.fingerprint" "port=${port}"
+    fi
+  done
+}
+
+###############################################################################
+# SNAPSHOTS / REPORTS
+###############################################################################
+
+snapshot_hexstrike() {
+  {
+    echo "==== $(ts) HEXSTRIKE HEALTH ===="
+    curl -fsS "$HEX_HEALTH_URL" 2>/dev/null || echo "health: unavailable"
+    echo
+    echo "==== VERSION ===="
+    curl -fsS "$HEX_VERSION_URL" 2>/dev/null || echo "version: unavailable"
+    echo
+    echo "==== PORT ${HEX_PORT} ===="
+    ss -ltnp 2>/dev/null | grep ":${HEX_PORT} " || echo "${HEX_PORT} not listening"
+    echo
+    echo "==== HEXSTRIKE PROCESSES ===="
+    pgrep -af 'hexstrike_server|hexstrike_mcp|hexstrike_server.py|hexstrike_mcp.py' || true
+  } | write_atomic "${REP}/hexstrike_status.txt"
+}
+
+snapshot_system() {
+  {
+    echo "==== $(ts) SYSTEM SNAPSHOT ===="
+    echo
+    echo "---- uptime ----"
+    uptime
+    echo
+    echo "---- memory ----"
+    free -h
+    echo
+    echo "---- disk ----"
+    df -h /
+    echo
+    echo "---- top cpu ----"
+    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%cpu | head -n 20
+    echo
+    echo "---- top memory ----"
+    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%mem | head -n 20
+  } | write_atomic "${REP}/system_status.txt"
+}
+
+snapshot_tools() {
+  {
+    echo "==== $(ts) TOOL VISIBILITY ===="
+    for t in \
+      hexstrike_server hexstrike_mcp \
+      airmon-ng airodump-ng aireplay-ng aircrack-ng \
+      amass steghide testdisk \
+      shodan shodan-cli censys censys-cli checkov uro anew qsreplace \
+      theHarvester theharvester paramspider \
+      curl ss ps tee jq python3 bash; do
+      printf '%-15s -> ' "$t"
+      command -v "$t" || echo "missing"
+    done
+  } | write_atomic "${REP}/tool_status.txt"
+}
+
+snapshot_journal() {
+  {
+    echo "==== $(ts) RECENT AUTH / NETWORK EVENTS ===="
+    journalctl -n 250 --no-pager 2>/dev/null | \
+      grep -Ei 'failed password|authentication failure|invalid user|sudo:|:8888|GET /health|GET /version' | \
+      tail -n 80 || true
+  } | write_atomic "${REP}/journal_status.txt"
+}
+
+write_alerts() {
+  {
+    if ss -ltn 2>/dev/null | grep -q "0.0.0.0:${HEX_PORT}"; then
+      echo "[ALERT] HexStrike API is exposed on 0.0.0.0:${HEX_PORT}"
+    fi
+    if ! hex_health_up; then
+      echo "[ALERT] HexStrike health endpoint is unavailable on 127.0.0.1:${HEX_PORT}"
+    fi
+    if ! rule_present; then
+      echo "[ALERT] Defensive firewall rule for tcp/${HEX_PORT} is missing"
+    fi
+    if have_cmd theHarvester && [ ! -x "${HOME}/.local/bin/theharvester" ]; then
+      echo "[ALERT] Lowercase theharvester wrapper missing"
+    fi
+    if [ "$(file_age "${REP}/hexstrike_status.txt")" -gt 120 ]; then
+      echo "[ALERT] HexStrike status report is stale"
+    fi
+  } | write_atomic "${REP}/alerts.txt"
+}
+
+build_ai_input() {
+  {
+    echo "DATE: $(ts)"
+    echo
+    echo "=== HEXSTRIKE STATUS ==="
+    safe_cat "${REP}/hexstrike_status.txt" 220
+    echo
+    echo "=== ALERTS ==="
+    safe_cat "${REP}/alerts.txt" 120
+    echo
+    echo "=== CLASSIFIED LISTENER DIFF ==="
+    safe_cat "${REP}/listener_diff.classified.txt" 180
+    echo
+    echo "=== CONNECTION DIFF ==="
+    safe_cat "${REP}/connection_diff.txt" 120
+    echo
+    echo "=== TOOL STATUS ==="
+    safe_cat "${REP}/tool_status.txt" 120
+    echo
+    echo "=== SYSTEM STATUS ==="
+    safe_cat "${REP}/system_status.txt" 160
+  } | write_atomic "${AI}/decision_input.txt"
+}
+
+run_ai_rules() {
+  python3 - <<'PY' | write_atomic "${REP}/ai_decision.txt"
+from pathlib import Path
+import re
+
+base = Path.home() / "hexwatch_v3"
+inp = (base / "ai" / "decision_input.txt").read_text(errors="ignore")
+
+score = 0
+risk = "low"
+summary = []
+risks = []
+actions = []
+safe_auto = []
+trigger = []
+decision = "observe_only"
+reason = []
+
+def set_risk():
+    global risk, score
+    if score >= 70:
+        risk = "high"
+    elif score >= 35:
+        risk = "medium"
+    else:
+        risk = "low"
+
+if "0.0.0.0:8888" in inp:
+    score += 50
+    summary.append("HexStrike API is exposed on all interfaces on tcp/8888.")
+    risks.append("Remote access to the local AI service from the LAN may be possible.")
+    actions.append("Restrict tcp/8888 with firewall enforcement and prefer localhost-only binding.")
+    safe_auto.append("Maintain a single firewall rule for tcp/8888.")
+    trigger.append("broad_bind_8888")
+    reason.append("broad bind detected")
+
+if '"status":"healthy"' in inp or "status\\\":\\\"healthy" in inp:
+    summary.append("HexStrike health endpoint is responding.")
+else:
+    score += 20
+    risks.append("HexStrike health endpoint may be unavailable.")
+    actions.append("Restart HexStrike server and MCP if health checks fail.")
+    trigger.append("health_down")
+    reason.append("health missing")
+
+if "theharvester ->" in inp.lower() or '"theharvester":true' in inp.lower():
+    summary.append("theHarvester is available to the toolchain.")
+if 'shodan-cli' in inp.lower():
+    summary.append("CLI wrapper visibility is good for shodan-cli.")
+if 'censys-cli' in inp.lower():
+    summary.append("CLI wrapper visibility is good for censys-cli.")
+
+public_block = re.search(r"---- public ----(.*?)---- other ----", inp, re.S | re.I)
+if public_block:
+    lines = [ln.strip() for ln in public_block.group(1).splitlines() if ln.strip()]
+    non_8888 = [ln for ln in lines if ":8888" not in ln]
+    if non_8888:
+        score += 30
+        risks.append("New public listening sockets were detected outside tcp/8888.")
+        actions.append("Validate any new public listeners against expected applications.")
+        safe_auto.append("Fingerprint and optionally firewall non-whitelisted public ports.")
+        trigger.append("new_public_listener")
+        reason.append("unexpected public listeners")
+
+if "firewall rule for tcp/8888 is missing" in inp.lower():
+    score += 25
+    risks.append("Protective firewall enforcement for tcp/8888 is missing.")
+    actions.append("Reapply the localhost-only DROP rule for tcp/8888.")
+    safe_auto.append("Insert one localhost-only DROP rule and remove duplicates.")
+    trigger.append("firewall_rule_missing")
+    reason.append("missing safeguard")
+
+if "new outbound/established" in inp.lower():
+    summary.append("Outbound connection tracking is active.")
+
+set_risk()
+
+if score >= 70:
+    decision = "contain_and_harden"
+elif score >= 35:
+    decision = "defensive_response"
+else:
+    decision = "observe_only"
+
+if not summary:
+    summary.append("Host appears stable with no immediate critical fault inferred.")
+if not risks:
+    risks.append("No urgent defensive issue was inferred from current reports.")
+if not actions:
+    actions.append("Continue monitoring and keep archival snapshots running.")
+if not safe_auto:
+    safe_auto.append("Refresh reports and continue defensive monitoring.")
+if not trigger:
+    trigger.append("routine_cycle")
+if not reason:
+    reason.append("steady state")
+
+print(f"RISK_LEVEL: {risk}")
+print(f"SCORE: {score}")
+print(f"TRIGGER: {', '.join(trigger[:4])}")
+print(f"ACTION_DECISION: {decision}")
+print(f"ACTION_REASON: {'; '.join(reason[:4])}")
+print("SUMMARY:")
+for x in summary[:5]:
+    print(f"- {x}")
+print("TOP_RISKS:")
+for x in risks[:4]:
+    print(f"- {x}")
+print("RECOMMENDED_ACTIONS:")
+for x in actions[:5]:
+    print(f"- {x}")
+print("SAFE_AUTO_ACTIONS:")
+for x in safe_auto[:5]:
+    print(f"- {x}")
+PY
+}
+
+apply_safe_actions() {
+  local decision
+  decision="$(grep '^ACTION_DECISION:' "${REP}/ai_decision.txt" 2>/dev/null | sed 's/^ACTION_DECISION:[[:space:]]*//')"
+
+  case "$decision" in
+    contain_and_harden)
+      ensure_firewall_rule
+      grep -A50 '^---- public ----' "${REP}/listener_diff.classified.txt" 2>/dev/null | \
+        grep -Eo ':[0-9]{2,5}\b' | tr -d ':' | sort -u | while read -r port; do
+          [ -n "$port" ] || continue
+          [ "$port" = "$HEX_PORT" ] && continue
+          is_whitelisted_port "$port" || block_port_nonlocal "$port"
+        done
+      ;;
+    defensive_response)
+      ensure_firewall_rule
+      fingerprint_new_public_ports
+      ensure_hexstrike_running
+      ;;
+    observe_only|*)
+      :
+      ;;
+  esac
+}
+
+write_rollup() {
+  {
+    echo "==================== HEXWATCH ROLLUP ===================="
+    date
+    echo
+    echo "---- alerts ----"
+    safe_cat "${REP}/alerts.txt" 80
+    echo
+    echo "---- ai decision ----"
+    safe_cat "${REP}/ai_decision.txt" 120
+    echo
+    echo "---- hexstrike status ----"
+    safe_cat "${REP}/hexstrike_status.txt" 80
+    echo
+    echo "---- listener diff classified ----"
+    safe_cat "${REP}/listener_diff.classified.txt" 120
+    echo
+    echo "---- connection diff ----"
+    safe_cat "${REP}/connection_diff.txt" 80
+    echo
+    echo "---- tool status ----"
+    safe_cat "${REP}/tool_status.txt" 80
+    echo
+    echo "---- runtime state ----"
+    safe_cat "${STATE}/runtime_state.json" 80
+  } | write_atomic "${REP}/rollup.txt"
+}
+
+archive_reports() {
+  local stamp
+  stamp="$(date '+%Y%m%d_%H%M%S')"
+  tar -czf "${ARC}/hexwatch_${stamp}.tgz" -C "$BASE" reports logs state >/dev/null 2>&1 || true
+  find "$ARC" -type f -name 'hexwatch_*.tgz' | sort | head -n -10 | xargs -r rm -f
+}
+
+render_dashboard() {
+  clear
+  echo "==================== HEXWATCH MONOLITH V3 ===================="
+  date
+  echo
+  [ -s "${REP}/alerts.txt" ] && sed -n '1,40p' "${REP}/alerts.txt" || echo "[OK] No active alerts"
+  echo
+  safe_cat "${REP}/ai_decision.txt" 80
+  echo
+  echo "---- launch state ----"
+  echo "health: $(hex_health_up && echo up || echo down)"
+  echo "firewall-rule-count: $(firewall_rule_count)"
+  echo "server-procs: $(pgrep -af 'hexstrike_server.py|hexstrike_server --port '"${HEX_PORT}" | wc -l)"
+  echo "mcp-procs: $(pgrep -af 'hexstrike_mcp.py|/usr/bin/hexstrike_mcp' | wc -l)"
+  echo "whitelist-ports: ${WHITELIST_PORTS}"
+  echo
+  echo "reports: ${REP}"
+  echo "logs:    ${LOG}"
+  echo "archive: ${ARC}"
+}
+
+write_helpers() {
+  cat > "${BIN}/hexwatch_save.sh" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="${HOME}/hexwatch_v3"
+STAMP="$(date '+%Y%m%d_%H%M%S')"
+OUT="${HOME}/hexwatch_v3_snapshot_${STAMP}.tgz"
+tar -czf "$OUT" -C "$BASE" . && echo "$OUT"
+EOS
+  chmod +x "${BIN}/hexwatch_save.sh"
+
+  cat > "${BIN}/hexwatch_stop.sh" <<'EOS'
+#!/usr/bin/env bash
+pkill -f "${HOME}/hexwatch_v3/hexwatch_monolith_v3.sh" || true
+EOS
+  chmod +x "${BIN}/hexwatch_stop.sh"
+
+  cat > "${BIN}/hexwatch_status.sh" <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+sed -n '1,160p' "${HOME}/hexwatch_v3/reports/rollup.txt"
+EOS
+  chmod +x "${BIN}/hexwatch_status.sh"
+}
+
+main() {
+  init_dirs
+  write_root_helper
+  write_helpers
+  create_tool_wrappers
+  ensure_hexstrike_running
+  ensure_firewall_rule
+
+  local next_defense next_ai next_main next_render now
+  now="$(epoch)"
+  next_defense="$now"
+  next_ai="$now"
+  next_main="$now"
+  next_render="$now"
+
+  while true; do
+    now="$(epoch)"
+
+    if [ "$now" -ge "$next_defense" ]; then
+      snapshot_hexstrike
+      snapshot_system
+      snapshot_tools
+      snapshot_journal
+      diff_listeners
+      diff_connections
+      build_classified_listener_report
+      fingerprint_new_public_ports
+      write_alerts
+      next_defense=$((now + INTERVAL_DEFENSE))
+    fi
+
+    if [ "$now" -ge "$next_ai" ]; then
+      build_ai_input
+      run_ai_rules
+      apply_safe_actions
+      local risk score
+      risk="$(grep '^RISK_LEVEL:' "${REP}/ai_decision.txt" 2>/dev/null | awk '{print $2}' || echo unknown)"
+      score="$(grep '^SCORE:' "${REP}/ai_decision.txt" 2>/dev/null | awk '{print $2}' || echo 0)"
+      record_runtime_state "$(hex_health_up && echo up || echo down)" "$risk" "$score" "ai_cycle" "$(firewall_rule_count)"
+      next_ai=$((now + INTERVAL_AI))
+    fi
+
+    if [ "$now" -ge "$next_main" ]; then
+      write_rollup
+      archive_reports
+      next_main=$((now + INTERVAL_MAIN))
+    fi
+
+    if [ "$now" -ge "$next_render" ]; then
+      render_dashboard
+      next_render=$((now + INTERVAL_RENDER))
+    fi
+
+    sleep 1
+  done
+}
+
+main "$@"
+EOF
+chmod +x ~/hexwatch_v3/hexwatch_monolith_v3.sh
+~/hexwatch_v3/hexwatch_monolith_v3.sh
