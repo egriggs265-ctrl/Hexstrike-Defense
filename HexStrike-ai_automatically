@@ -1,0 +1,203 @@
+cat > ~/hexwatch/defense_loop.sh <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+STATE_DIR="$HOME/hexwatch/state"
+LOG_DIR="$HOME/hexwatch/logs"
+REP_DIR="$HOME/hexwatch/reports"
+INTERVAL="${1:-30}"
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:$HOME/go/bin:$HOME/.local/bin:$PATH"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$REP_DIR"
+
+SERVER_CMD="hexstrike_server --port 8888"
+MCP_CMD="python3 /usr/share/hexstrike-ai/hexstrike_mcp.py --server http://127.0.0.1:8888"
+
+log_msg() {
+  echo "[$(date '+%F %T')] $*" | tee -a "$LOG_DIR/defense_loop.log" >/dev/null
+}
+
+snapshot_listeners() {
+  ss -ltnup 2>/dev/null | sed 's/[[:space:]]\+/ /g' | sort
+}
+
+snapshot_hexstrike() {
+  {
+    echo "==== $(date '+%F %T') HEXSTRIKE HEALTH ===="
+    curl -fsS http://127.0.0.1:8888/health 2>/dev/null || echo "health: unavailable"
+    echo
+    echo "==== VERSION ===="
+    curl -fsS http://127.0.0.1:8888/version 2>/dev/null || echo "version: unavailable"
+    echo
+    echo "==== PORT 8888 ===="
+    ss -ltnp 2>/dev/null | grep ':8888 ' || echo "8888 not listening"
+    echo
+    echo "==== HEXSTRIKE PROCESSES ===="
+    pgrep -af 'hexstrike_server|hexstrike_mcp|hexstrike_server.py|hexstrike_mcp.py' || true
+  } > "$REP_DIR/hexstrike_status.txt"
+}
+
+snapshot_system() {
+  {
+    echo "==== $(date '+%F %T') SYSTEM SNAPSHOT ===="
+    echo
+    echo "---- uptime ----"
+    uptime
+    echo
+    echo "---- memory ----"
+    free -h
+    echo
+    echo "---- disk ----"
+    df -h /
+    echo
+    echo "---- top cpu ----"
+    ps -eo pid,user,%cpu,%mem,comm,args --sort=-%cpu | head -n 20
+  } > "$REP_DIR/system_status.txt"
+}
+
+snapshot_tools() {
+  {
+    echo "==== $(date '+%F %T') TOOL VISIBILITY ===="
+    for t in hexstrike_server airmon-ng airodump-ng aireplay-ng aircrack-ng amass steghide testdisk shodan checkov uro anew qsreplace theHarvester paramspider curl ss ps tee; do
+      printf '%-15s -> ' "$t"
+      command -v "$t" || echo "missing"
+    done
+  } > "$REP_DIR/tool_status.txt"
+}
+
+diff_listeners() {
+  local curr="$STATE_DIR/listeners.curr"
+  local prev="$STATE_DIR/listeners.prev"
+  snapshot_listeners > "$curr"
+
+  if [ -f "$prev" ]; then
+    {
+      echo "==== $(date '+%F %T') LISTENER DIFF ===="
+      echo
+      echo "---- added listeners ----"
+      comm -13 "$prev" "$curr" || true
+      echo
+      echo "---- removed listeners ----"
+      comm -23 "$prev" "$curr" || true
+    } > "$REP_DIR/listener_diff.txt"
+  else
+    {
+      echo "==== $(date '+%F %T') LISTENER DIFF ===="
+      echo "Baseline created."
+    } > "$REP_DIR/listener_diff.txt"
+  fi
+
+  cp "$curr" "$prev"
+}
+
+start_hexstrike_local() {
+  if ! ss -ltnp 2>/dev/null | grep -q '127.0.0.1:8888'; then
+    log_msg "Starting HexStrike server on localhost"
+    nohup bash -lc "export PATH=\"$PATH\"; $SERVER_CMD" > "$LOG_DIR/hexstrike_server.out" 2>&1 &
+    sleep 4
+  fi
+}
+
+start_mcp_if_missing() {
+  if ! pgrep -af 'hexstrike_mcp.py|/usr/bin/hexstrike_mcp' >/dev/null 2>&1; then
+    log_msg "Starting HexStrike MCP"
+    nohup bash -lc "export PATH=\"$PATH\"; $MCP_CMD" > "$LOG_DIR/hexstrike_mcp.out" 2>&1 &
+    sleep 3
+  fi
+}
+
+rebind_hexstrike_to_localhost() {
+  if ss -ltn 2>/dev/null | grep -q '0.0.0.0:8888'; then
+    log_msg "Auto-response: detected HexStrike exposed on 0.0.0.0:8888"
+    pkill -f 'hexstrike_server --port 8888' || true
+    pkill -f 'hexstrike_server.py --port 8888' || true
+    sleep 2
+    nohup bash -lc "export PATH=\"$PATH\"; hexstrike_server --host 127.0.0.1 --port 8888" > "$LOG_DIR/hexstrike_server.out" 2>&1 &
+    sleep 4
+    if ss -ltn 2>/dev/null | grep -q '127.0.0.1:8888'; then
+      log_msg "Auto-response: HexStrike rebound to 127.0.0.1:8888"
+    else
+      log_msg "Auto-response: localhost rebind failed, falling back to local firewall"
+      if command -v sudo >/dev/null 2>&1; then
+        sudo iptables -I INPUT -p tcp --dport 8888 ! -s 127.0.0.1 -j DROP >/dev/null 2>&1 || true
+        log_msg "Auto-response: firewall rule attempted for tcp/8888"
+      fi
+    fi
+  fi
+}
+
+heal_missing_wrappers() {
+  mkdir -p "$HOME/.local/bin"
+
+  if command -v theHarvester >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/theharvester" ]; then
+    ln -sf "$(command -v theHarvester)" "$HOME/.local/bin/theharvester" || true
+    log_msg "Auto-response: created lowercase theharvester wrapper"
+  fi
+
+  if command -v shodan >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/shodan-cli" ]; then
+    ln -sf "$(command -v shodan)" "$HOME/.local/bin/shodan-cli" || true
+    log_msg "Auto-response: created shodan-cli wrapper"
+  fi
+
+  if command -v censys >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/censys-cli" ]; then
+    ln -sf "$(command -v censys)" "$HOME/.local/bin/censys-cli" || true
+    log_msg "Auto-response: created censys-cli wrapper"
+  fi
+}
+
+alert_checks() {
+  : > "$REP_DIR/alerts.txt"
+
+  if ss -ltn 2>/dev/null | grep -q '0.0.0.0:8888'; then
+    echo "[ALERT] HexStrike API is exposed on 0.0.0.0:8888" >> "$REP_DIR/alerts.txt"
+  fi
+
+  if ! curl -fsS http://127.0.0.1:8888/health >/dev/null 2>&1; then
+    echo "[ALERT] HexStrike health endpoint is not responding on 127.0.0.1:8888" >> "$REP_DIR/alerts.txt"
+  fi
+
+  if [ ! -x "$HOME/.local/bin/theharvester" ] && command -v theHarvester >/dev/null 2>&1; then
+    echo "[ALERT] HexStrike lowercase wrapper for theharvester is missing" >> "$REP_DIR/alerts.txt"
+  fi
+}
+
+render_dashboard() {
+  clear
+  echo "==================== HEXWATCH AUTO-RESPONSE ===================="
+  date
+  echo
+  [ -s "$REP_DIR/alerts.txt" ] && cat "$REP_DIR/alerts.txt" || echo "[OK] No active alerts"
+  echo
+  echo "---- HexStrike status ----"
+  sed -n '1,40p' "$REP_DIR/hexstrike_status.txt"
+  echo
+  echo "---- Listener diff ----"
+  sed -n '1,30p' "$REP_DIR/listener_diff.txt"
+  echo
+  echo "---- Tool status ----"
+  sed -n '1,25p' "$REP_DIR/tool_status.txt"
+  echo
+  echo "Reports: $REP_DIR"
+  echo "Logs:    $LOG_DIR"
+  echo "Interval: ${INTERVAL}s"
+}
+
+heal_missing_wrappers
+start_hexstrike_local
+start_mcp_if_missing
+
+while true; do
+  rebind_hexstrike_to_localhost
+  heal_missing_wrappers
+  start_hexstrike_local
+  start_mcp_if_missing
+  snapshot_hexstrike
+  snapshot_system
+  snapshot_tools
+  diff_listeners
+  alert_checks
+  render_dashboard
+  sleep "$INTERVAL"
+done
+EOF
+chmod +x ~/hexwatch/defense_loop.sh && ~/hexwatch/defense_loop.sh 30
